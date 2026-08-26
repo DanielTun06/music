@@ -14,6 +14,8 @@ import requests
 HERE = os.path.dirname(os.path.abspath(__file__))
 CLIENT_ID_FILE = os.path.join(HERE, ".spotify_client_id")
 TOKEN_CACHE_FILE = os.path.join(HERE, ".spotify_token_cache.json")
+SP_DC_FILE = os.path.join(HERE, ".spotify_sp_dc")
+INTERNAL_TOKEN_CACHE_FILE = os.path.join(HERE, ".spotify_internal_token_cache.json")
 
 REDIRECT_URI = "http://127.0.0.1:8888/callback"
 SCOPES = "user-read-playback-state user-modify-playback-state user-read-currently-playing"
@@ -22,22 +24,50 @@ AUTH_URL = "https://accounts.spotify.com/authorize"
 TOKEN_URL = "https://accounts.spotify.com/api/token"
 API_BASE = "https://api.spotify.com/v1"
 
+OPEN_SPOTIFY_TOKEN_URL = "https://open.spotify.com/get_access_token"
+LYRICS_API_BASE = "https://spclient.wg.spotify.com/color-lyrics/v2/track"
+
 
 # -------------------------------------------------
-# CLIENT ID
+# LOCAL SECRETS (read a cached value from disk, or prompt for it once)
 # -------------------------------------------------
+def _get_or_prompt_secret(file_path, prompt_lines, prompt_text):
+    if os.path.exists(file_path):
+        with open(file_path) as f:
+            value = f.read().strip()
+        if value:
+            return value
+
+    for line in prompt_lines:
+        print(line)
+    value = input(prompt_text).strip()
+    with open(file_path, "w") as f:
+        f.write(value)
+
+    return value
+
+
 def get_client_id():
-    if os.path.exists(CLIENT_ID_FILE):
-        with open(CLIENT_ID_FILE) as f:
-            client_id = f.read().strip()
-        if client_id:
-            return client_id
+    return _get_or_prompt_secret(CLIENT_ID_FILE, [], "Enter your Spotify app's Client ID: ")
 
-    client_id = input("Enter your Spotify app's Client ID: ").strip()
-    with open(CLIENT_ID_FILE, "w") as f:
-        f.write(client_id)
 
-    return client_id
+# -------------------------------------------------
+# JSON TOKEN CACHES (OAuth token + the internal web-player token below)
+# -------------------------------------------------
+def _load_json_cache(path):
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def _save_json_cache(path, lock, data):
+    with lock:
+        with open(path, "w") as f:
+            json.dump(data, f)
 
 
 # -------------------------------------------------
@@ -86,16 +116,15 @@ def _wait_for_callback():
     return server.auth_code, server.auth_error
 
 
+_token_lock = threading.Lock()
+
+
 def _save_token(token_data):
-    with open(TOKEN_CACHE_FILE, "w") as f:
-        json.dump(token_data, f)
+    _save_json_cache(TOKEN_CACHE_FILE, _token_lock, token_data)
 
 
 def _load_token():
-    if not os.path.exists(TOKEN_CACHE_FILE):
-        return None
-    with open(TOKEN_CACHE_FILE) as f:
-        return json.load(f)
+    return _load_json_cache(TOKEN_CACHE_FILE)
 
 
 def _login(client_id):
@@ -288,3 +317,96 @@ class PlaybackTracker:
         with self._lock:
             self._progress_ms = seconds * 1000
             self._last_poll_monotonic = time.monotonic()
+
+
+# -------------------------------------------------
+# SPOTIFY'S OWN LYRICS (private/undocumented endpoint, Premium accounts only)
+# -------------------------------------------------
+# There is no lyrics endpoint in Spotify's public Web API. This talks to the
+# same private endpoint the open.spotify.com web player itself uses, which
+# needs the browser session's 'sp_dc' cookie rather than the OAuth token used
+# everywhere else in this file. It can change or stop working at any time
+# since it's not a supported public API.
+def get_sp_dc():
+    return _get_or_prompt_secret(
+        SP_DC_FILE,
+        [
+            "Spotify's own lyrics require your 'sp_dc' session cookie (Premium account,",
+            "logged into open.spotify.com). In your browser's dev tools > Application/Storage",
+            "> Cookies for open.spotify.com, copy the 'sp_dc' cookie's value.",
+        ],
+        "sp_dc cookie: ",
+    )
+
+
+_internal_token_lock = threading.Lock()
+
+
+def _load_internal_token():
+    return _load_json_cache(INTERNAL_TOKEN_CACHE_FILE)
+
+
+def _save_internal_token(token_data):
+    _save_json_cache(INTERNAL_TOKEN_CACHE_FILE, _internal_token_lock, token_data)
+
+
+def get_internal_web_token():
+    """Access token for Spotify's internal web-player endpoints — distinct
+    from the public Web API OAuth token — derived from the sp_dc cookie."""
+    token_data = _load_internal_token()
+    expires_at = (token_data or {}).get("accessTokenExpirationTimestampMs", 0) / 1000
+
+    if token_data and time.time() < expires_at - 30:
+        return token_data["accessToken"]
+
+    sp_dc = get_sp_dc()
+    resp = requests.get(
+        OPEN_SPOTIFY_TOKEN_URL,
+        params={"reason": "transport", "productType": "web_player"},
+        cookies={"sp_dc": sp_dc},
+        headers={"User-Agent": "Mozilla/5.0"},
+        timeout=10,
+    )
+    resp.raise_for_status()
+    token_data = resp.json()
+
+    if token_data.get("isAnonymous", True):
+        raise RuntimeError(
+            "Spotify rejected the sp_dc cookie (expired or invalid) — "
+            f"delete {os.path.basename(SP_DC_FILE)} and paste a fresh one."
+        )
+
+    _save_internal_token(token_data)
+    return token_data["accessToken"]
+
+
+def get_spotify_lyrics(track_id):
+    """Fetch this track's own lyrics straight from Spotify as
+    [(timestamp_sec, text), ...], or None if unavailable (no lyrics for this
+    track, not line-synced, non-Premium account, etc.)."""
+    token = get_internal_web_token()
+    resp = requests.get(
+        f"{LYRICS_API_BASE}/{track_id}",
+        params={"format": "json", "market": "from_token"},
+        headers={
+            "Authorization": f"Bearer {token}",
+            "App-platform": "WebPlayer",
+            "User-Agent": "Mozilla/5.0",
+        },
+        timeout=10,
+    )
+
+    if resp.status_code == 404:
+        return None
+    resp.raise_for_status()
+
+    lyrics = resp.json().get("lyrics") or {}
+    if lyrics.get("syncType") != "LINE_SYNCED":
+        return None
+
+    lines = [
+        (int(line.get("startTimeMs", 0)) / 1000, line.get("words", ""))
+        for line in lyrics.get("lines", [])
+    ]
+    lines.sort(key=lambda pair: pair[0])
+    return lines

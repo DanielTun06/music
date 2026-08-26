@@ -1,5 +1,7 @@
 .spotify_client_id
 .spotify_token_cache.json
+.spotify_sp_dc
+.spotify_internal_token_cache.json
 .lyrics_offset.json
 __pycache__/
 *.pyc

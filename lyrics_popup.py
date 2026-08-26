@@ -16,6 +16,7 @@ import numpy as np
 import pygame
 import requests
 import syncedlyrics
+import yt_dlp
 
 import spotify_client
 
@@ -51,10 +52,14 @@ CARD_FADE_ZONE_FRAC = 0.16
 # Typewriter reveal speed for the card text (milliseconds per character)
 TYPE_MS_PER_CHAR = 45
 
-# Card look
-CARD_COLOR = (255, 0, 0)
-CARD_AGED_COLOR = (78, 78, 82)  # what the card fades toward as it ages
-CARD_BORDER_COLOR = (245, 245, 245)
+# Card look — a single smooth bright red with a warm glow border
+CARD_COLOR = (225, 41, 46)           # main card fill — flat, bright red
+CARD_AGED_COLOR = (79, 58, 60)       # muted burgundy-gray the card fades toward as it ages
+CARD_BORDER_COLOR = (255, 243, 248)  # thin warm pink-white border
+CARD_GLOW_COLOR = (255, 77, 87)      # soft glow close around the border
+CARD_OUTER_GLOW = (205, 36, 44)      # dimmer red glow further out, for atmosphere
+CARD_TEXT_COLOR = (255, 166, 128)    # glowing red-orange lyric text — bright enough to stay crisp against the dark fill
+CARD_TEXT_GLOW = (255, 90, 58)       # glow behind the lyric text — brighter/warmer so it doesn't read as gloomy
 CARD_CORNER_RADIUS = 20
 CARD_MAX_TEXT_WIDTH = 260
 CARD_MIN_WIDTH = 320
@@ -73,17 +78,17 @@ OFFSET_FILE = os.path.join(HERE, ".lyrics_offset.json")
 # -------------------------------------------------
 # COLORS
 # -------------------------------------------------
-PANEL = (28, 28, 38)
-BORDER = (110, 30, 45)
+PANEL = (36, 36, 49)
+BORDER = (141, 38, 58)
 
-WHITE = (230, 230, 230)
-DIM = (110, 110, 120)
-RED = (200, 40, 60)
-DARK_RED = (100, 20, 30)
+WHITE = (253, 253, 253)
+DIM = (141, 141, 154)
+RED = (255, 51, 77)
+DARK_RED = (128, 26, 38)
 
-SNOW_COLOR = (235, 240, 250)
-LEAF_COLORS = [(196, 88, 42), (214, 138, 46), (168, 60, 40), (222, 168, 60)]
-NOTE_COLORS = [(210, 45, 65), (235, 95, 105)]
+SNOW_COLOR = (247, 252, 255)
+LEAF_COLORS = [(251, 113, 54), (255, 177, 59), (215, 77, 51), (255, 215, 77)]
+NOTE_COLORS = [(255, 0, 30), (255, 40, 60)]
 NOTE_GLYPHS = ["♪", "♫"]
 
 WEATHER_MODES = ["notes", "snow", "leaves", "off"]
@@ -116,6 +121,7 @@ def resolve_spotify_track(url):
     if not match:
         raise ValueError("That doesn't look like a Spotify track link.")
     track_id = match.group(1)
+    
 
     page_url = f"https://open.spotify.com/track/{track_id}"
     resp = requests.get(page_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
@@ -155,7 +161,10 @@ LRC_TIME_RE = re.compile(r"\[(\d+):(\d+(?:\.\d+)?)\]")
 
 def fetch_synced_lyrics(title, artist):
     query = f"{title} {artist}".strip()
-    lrc = syncedlyrics.search(query)
+    try:
+        lrc = syncedlyrics.search(query)
+    except Exception:
+        return None
 
     if not lrc:
         return None
@@ -174,6 +183,97 @@ def fetch_synced_lyrics(title, artist):
 
     lines.sort(key=lambda pair: pair[0])
     return lines
+
+
+def _pick_caption_track(video_info):
+    """Prefer a manually-uploaded caption track in any language over
+    auto-generated ones — a human-uploaded track is almost always the real
+    lyric transcript, while auto captions are just speech-to-text noise for
+    songs. Only fall back to auto-generated English captions if no manual
+    track exists at all. Requests json3 since it's the simplest to parse."""
+    manual = video_info.get("subtitles") or {}
+    for lang, formats in manual.items():
+        for fmt in formats:
+            if fmt.get("ext") == "json3":
+                return fmt.get("url")
+
+    auto = video_info.get("automatic_captions") or {}
+    for lang in ("en", "en-US", "en-GB", "a.en"):
+        for fmt in auto.get(lang, []):
+            if fmt.get("ext") == "json3":
+                return fmt.get("url")
+    return None
+
+
+def fetch_youtube_lyrics(title, artist):
+    """Last-resort fallback: find a YouTube lyric video for the track and pull
+    its captions as synced lyrics. Caption quality/timing varies a lot more
+    than Spotify or LRC sources, but it's better than nothing."""
+    query = f"{title} {artist} lyrics".strip()
+    ydl_opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "skip_download": True,
+        "extract_flat": False,
+    }
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(f"ytsearch1:{query}", download=False)
+    except Exception:
+        return None
+
+    entries = info.get("entries") if info else None
+    video = entries[0] if entries else info
+    if not video:
+        return None
+
+    caption_url = _pick_caption_track(video)
+    if not caption_url:
+        return None
+
+    try:
+        resp = requests.get(caption_url, timeout=10)
+        resp.raise_for_status()
+        events = resp.json().get("events", [])
+    except Exception:
+        return None
+
+    lines = []
+    for event in events:
+        segs = event.get("segs")
+        if not segs:
+            continue
+        text = "".join(seg.get("utf8", "") for seg in segs).replace("\n", " ").strip()
+        if not text:
+            continue
+        lines.append((event.get("tStartMs", 0) / 1000, text))
+
+    lines.sort(key=lambda pair: pair[0])
+    return lines or None
+
+
+def get_lyrics(title, artist, track_id):
+    """Prefer Spotify's own lyrics for this track; fall back to a
+    title/artist lyric search when they're unavailable (no Premium account,
+    no sp_dc cookie set up, no lyrics for this track, etc.), and finally to
+    a YouTube lyric video's captions if even that search comes up empty."""
+    print("Fetching lyrics from Spotify...")
+    try:
+        lyric_lines = spotify_client.get_spotify_lyrics(track_id)
+    except Exception as exc:
+        print(f"Couldn't get Spotify's own lyrics ({exc}); falling back to lyric search...")
+        lyric_lines = None
+
+    if lyric_lines:
+        return lyric_lines
+
+    print("Searching for synced lyrics...")
+    lyric_lines = fetch_synced_lyrics(title, artist)
+    if lyric_lines:
+        return lyric_lines
+
+    print("Searching YouTube for lyrics...")
+    return fetch_youtube_lyrics(title, artist)
 
 
 # -------------------------------------------------
@@ -256,11 +356,17 @@ def blit_glow_text(surface, font, text, pos, text_color, glow_color, glow_alpha=
     return main_rect
 
 
-def build_card_glow_surface(card_w, card_h, color, alpha_scale=1.0):
+def build_card_glow_surface(card_w, card_h, inner_color, outer_color, alpha_scale=1.0):
     """Build a compact drop-shadow + glow-ring halo sized to an unrotated card_w x
     card_h box, as its own Surface — so the caller can rotate it together with the
-    card to keep the glow aligned with its tilt."""
-    rings = ((14, 20), (9, 40), (4, 65))
+    card to keep the glow aligned with its tilt. The rings gradate from
+    `inner_color` closest to the card out to the dimmer `outer_color`, so the glow
+    reads as soft and atmospheric rather than a flat neon outline."""
+    rings = (
+        (14, 20, outer_color),
+        (9, 40, lerp_color(outer_color, inner_color, 0.5)),
+        (4, 65, inner_color),
+    )
     pad = rings[0][0] + 10
 
     surf_w, surf_h = card_w + pad * 2, card_h + pad * 2
@@ -271,11 +377,11 @@ def build_card_glow_surface(card_w, card_h, color, alpha_scale=1.0):
     pygame.draw.rect(shadow, (0, 0, 0, int(110 * alpha_scale)), (0, 0, card_w, card_h), border_radius=CARD_CORNER_RADIUS)
     glow_surf.blit(shadow, shadow.get_rect(center=(center[0] + 4, center[1] + 6)))
 
-    for expand, alpha in rings:
+    for expand, alpha, ring_color in rings:
         ring_w, ring_h = card_w + expand * 2, card_h + expand * 2
         ring_surf = pygame.Surface((ring_w, ring_h), pygame.SRCALPHA)
         pygame.draw.rect(
-            ring_surf, (*color, int(alpha * alpha_scale)), (0, 0, ring_w, ring_h),
+            ring_surf, (*ring_color, int(alpha * alpha_scale)), (0, 0, ring_w, ring_h),
             border_radius=CARD_CORNER_RADIUS + expand // 2,
         )
         glow_surf.blit(ring_surf, ring_surf.get_rect(center=center))
@@ -306,7 +412,7 @@ SCRIPT_FONT_NAMES = {
     "thai": ["Leelawadee UI", "Tahoma"],
     "devanagari": ["Nirmala UI", "Mangal"],
     "indic": ["Nirmala UI"],
-    "myanmar": ["Myanmar Text", "Padauk"],
+    "myanmar": ["Myanmar Text", "Padauk", "Noto Sans Myanmar"],  # Unicode-encoded Myanmar; Zawgyi text needs separate conversion
     "armenian_georgian": ["Segoe UI"],
     "default": ["Consolas"],
 }
@@ -419,6 +525,21 @@ class MultiScriptFont:
         return composite
 
 
+def _wrap_word_by_char(font, word, max_width, lines):
+    """Break a single 'word' character-by-character instead of all at once —
+    needed for scripts like CJK/Thai that don't use spaces, where a whole
+    line can otherwise arrive as one unbreakable chunk wider than the card."""
+    current = ""
+    for ch in word:
+        trial = current + ch
+        if font.size(trial)[0] <= max_width or not current:
+            current = trial
+        else:
+            lines.append(current)
+            current = ch
+    return current
+
+
 def wrap_text(font, text, max_width):
     words = text.split()
     lines = []
@@ -428,6 +549,12 @@ def wrap_text(font, text, max_width):
         trial = f"{current} {word}".strip()
         if font.size(trial)[0] <= max_width or not current:
             current = trial
+        elif font.size(word)[0] > max_width:
+            # The word alone is wider than the card (long unbroken CJK/Thai/etc.
+            # run) — fall back to breaking it by character instead of letting
+            # it overflow.
+            lines.append(current)
+            current = _wrap_word_by_char(font, word, max_width, lines)
         else:
             lines.append(current)
             current = word
@@ -528,9 +655,11 @@ def draw_lyric_card(canvas, card, synced_elapsed, active_font):
     if card_alpha <= 0:
         return None
 
-    # Desaturate from vivid red toward gray as the card ages
+    # Desaturate from wine red toward muted burgundy-gray as the card ages
     age_t = (card_progress - CARD_AGE_START_FRAC) / (CARD_AGE_END_FRAC - CARD_AGE_START_FRAC)
     card_color = lerp_color(CARD_COLOR, CARD_AGED_COLOR, age_t)
+    glow_inner = lerp_color(CARD_GLOW_COLOR, CARD_AGED_COLOR, age_t)
+    glow_outer = lerp_color(CARD_OUTER_GLOW, CARD_AGED_COLOR, age_t)
 
     # Text types in right alongside the popup's own entrance, not delayed behind it
     reveal_count = int((card_elapsed * 1000) / TYPE_MS_PER_CHAR)
@@ -551,15 +680,6 @@ def draw_lyric_card(canvas, card, synced_elapsed, active_font):
     card_surf = pygame.Surface((card_w, card_h), pygame.SRCALPHA)
     pygame.draw.rect(card_surf, (*card_color, 255), (0, 0, card_w, card_h), border_radius=CARD_CORNER_RADIUS)
 
-    # Glossy highlight across the top half
-    highlight_h = int(card_h * 0.45)
-    highlight = pygame.Surface((card_w, highlight_h), pygame.SRCALPHA)
-    pygame.draw.rect(
-        highlight, (255, 255, 255, 35), (0, 0, card_w, highlight_h),
-        border_top_left_radius=CARD_CORNER_RADIUS, border_top_right_radius=CARD_CORNER_RADIUS,
-    )
-    card_surf.blit(highlight, (0, 0))
-
     pygame.draw.rect(card_surf, (*CARD_BORDER_COLOR, 255), (0, 0, card_w, card_h), 3, border_radius=CARD_CORNER_RADIUS)
 
     # Top drag-handle marks
@@ -579,7 +699,8 @@ def draw_lyric_card(canvas, card, synced_elapsed, active_font):
 
         if revealed_line:
             revealed_rect = blit_glow_text(
-                card_surf, active_font, revealed_line, (start_x, mid_y), WHITE, card_color
+                card_surf, active_font, revealed_line, (start_x, mid_y), CARD_TEXT_COLOR, CARD_TEXT_GLOW,
+                glow_alpha=75,
             )
             cursor_pos = (revealed_rect.right + 2, mid_y)
         elif cursor_pos is None:
@@ -593,10 +714,10 @@ def draw_lyric_card(canvas, card, synced_elapsed, active_font):
         cursor_rect = pygame.Rect(0, 0, 2, cursor_h)
         cursor_rect.midleft = cursor_pos
         cursor_surf = pygame.Surface(cursor_rect.size, pygame.SRCALPHA)
-        cursor_surf.fill((*WHITE, blink_alpha))
+        cursor_surf.fill((*CARD_TEXT_COLOR, blink_alpha))
         card_surf.blit(cursor_surf, cursor_rect)
 
-    glow_surf = build_card_glow_surface(card_w, card_h, card_color, alpha_scale=card_alpha / 255)
+    glow_surf = build_card_glow_surface(card_w, card_h, glow_inner, glow_outer, alpha_scale=card_alpha / 255)
 
     # Subtle ambient float/bob/sway on top of the main slide — each card has its
     # own phase so multiple cards never move identically
@@ -780,11 +901,10 @@ class LayeredWindow:
 
     def present(self, surface):
         """Convert the surface to premultiplied-alpha BGRA and push it to the window."""
-        rgb = pygame.surfarray.array3d(surface)         # (W, H, 3)
-        alpha = pygame.surfarray.array_alpha(surface)    # (W, H)
-
-        rgb = np.transpose(rgb, (1, 0, 2))                # (H, W, 3)
-        alpha = np.transpose(alpha, (1, 0))                # (H, W)
+        # pixels3d/pixels_alpha are direct views into the surface's own buffer
+        # (no copy), unlike array3d/array_alpha — meaningful at 60 FPS full-screen.
+        rgb = np.transpose(pygame.surfarray.pixels3d(surface), (1, 0, 2))     # (H, W, 3)
+        alpha = np.transpose(pygame.surfarray.pixels_alpha(surface), (1, 0))  # (H, W)
 
         alpha16 = alpha.astype(np.uint16)
         premult = (rgb.astype(np.uint16) * alpha16[:, :, None] // 255).astype(np.uint8)
@@ -862,8 +982,6 @@ class WindowController:
 # -------------------------------------------------
 def run_popup(title, lyric_lines, tracker, art_surface):
     global WIDTH, HEIGHT
-
-    pygame.init()
 
     desktop_sizes = pygame.display.get_desktop_sizes()
     if desktop_sizes:
@@ -1126,8 +1244,7 @@ def main():
         print(f"Failed to start playback: {exc}")
         sys.exit(1)
 
-    print("Searching for synced lyrics...")
-    lyric_lines = fetch_synced_lyrics(title, artist)
+    lyric_lines = get_lyrics(title, artist, track_id)
 
     if lyric_lines:
         print(f"Found {len(lyric_lines)} synced lines.")
