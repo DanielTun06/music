@@ -159,16 +159,16 @@ def download_album_art(art_url):
 LRC_TIME_RE = re.compile(r"\[(\d+):(\d+(?:\.\d+)?)\]")
 
 
-def fetch_synced_lyrics(title, artist):
-    query = f"{title} {artist}".strip()
-    try:
-        lrc = syncedlyrics.search(query)
-    except Exception:
-        return None
+# Tried in this order, one provider at a time — syncedlyrics.search() always
+# tries its own internal list Musixmatch-first regardless of what order we
+# pass in `providers`, and Musixmatch's free-tier match is sometimes for the
+# wrong version of a track (e.g. an extended/looped edit), giving a
+# technically-synced but badly mistimed result. Querying providers ourselves,
+# in this order, lets Lrclib/NetEase's usually-correct timing win first.
+SYNCED_LYRICS_PROVIDERS = ["Lrclib", "NetEase", "Musixmatch", "Genius", "Megalobiz"]
 
-    if not lrc:
-        return None
 
+def _parse_lrc(lrc):
     lines = []
     for raw_line in lrc.splitlines():
         times = LRC_TIME_RE.findall(raw_line)
@@ -183,6 +183,44 @@ def fetch_synced_lyrics(title, artist):
 
     lines.sort(key=lambda pair: pair[0])
     return lines
+
+
+def _looks_degenerate(lines):
+    """Flags an LRC that is mostly a handful of lines looping over a long
+    span — a sign the match is for the wrong edit/version of the track
+    rather than genuine repeated lyrics (verse/chorus repetition is normal,
+    but this ratio of unique-to-total is not)."""
+    non_blank = [text for _, text in lines if text]
+    if len(non_blank) < 10:
+        return False
+    unique_ratio = len(set(non_blank)) / len(non_blank)
+    return unique_ratio < 0.4
+
+
+def fetch_synced_lyrics(title, artist):
+    query = f"{title} {artist}".strip()
+    fallback_lines = None
+
+    for provider in SYNCED_LYRICS_PROVIDERS:
+        try:
+            lrc = syncedlyrics.search(query, providers=[provider], synced_only=True)
+        except Exception:
+            continue
+
+        if not lrc:
+            continue
+
+        lines = _parse_lrc(lrc)
+        if not lines:
+            continue
+
+        if not _looks_degenerate(lines):
+            return lines
+
+        if fallback_lines is None:
+            fallback_lines = lines
+
+    return fallback_lines
 
 
 def _pick_caption_track(video_info):
