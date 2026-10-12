@@ -328,6 +328,9 @@ class PlaybackTracker:
 # everywhere else in this file. It can change or stop working at any time
 # since it's not a supported public API.
 def get_sp_dc():
+    if os.environ.get("SPOTIFY_SP_DC"):
+        return os.environ["SPOTIFY_SP_DC"].strip()
+
     return _get_or_prompt_secret(
         SP_DC_FILE,
         [
@@ -419,9 +422,14 @@ def get_internal_web_token():
         token_data = _fetch_internal_token_via_browser(sp_dc)
 
     if token_data.get("isAnonymous", True):
+        # Clear the stale cookie (and any cached token) so the next run
+        # prompts for a fresh one instead of failing the same way forever.
+        for path in (SP_DC_FILE, INTERNAL_TOKEN_CACHE_FILE):
+            if os.path.exists(path):
+                os.remove(path)
         raise RuntimeError(
             "Spotify rejected the sp_dc cookie (expired or invalid) — "
-            f"delete {os.path.basename(SP_DC_FILE)} and paste a fresh one."
+            "run again and paste a fresh one."
         )
 
     _save_internal_token(token_data)
